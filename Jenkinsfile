@@ -1,6 +1,6 @@
 pipeline {
     agent any
-    
+
     parameters {
         choice(
             name: 'ACTION',
@@ -10,7 +10,7 @@ pipeline {
         booleanParam(
             name: 'ANALYZE_LOGS',
             defaultValue: true,
-            description: 'Enable log analysis'
+            description: 'Enable Apache log analysis'
         )
         string(
             name: 'LOG_LINES',
@@ -18,212 +18,150 @@ pipeline {
             description: 'Number of log lines to analyze'
         )
     }
-    
+
     environment {
-        APACHE_LOG = '/var/log/apache2/access.log'
-        ERROR_LOG = '/var/log/apache2/error.log'
         REPORT_FILE = "apache_error_report_${BUILD_NUMBER}.txt"
     }
-    
+
     stages {
-        stage('Check Apache Installation') {
+
+        stage('Detect OS & Apache Paths') {
             steps {
                 script {
-                    echo '=== Checking if Apache is installed ==='
-                    def apacheInstalled = sh(
-                        script: 'which apache2 || which httpd',
-                        returnStatus: true
-                    )
-                    
-                    if (apacheInstalled != 0) {
-                        echo 'Apache not found, will install...'
-                        env.NEEDS_INSTALL = 'true'
-                    } else {
-                        echo 'Apache already installed'
-                        env.NEEDS_INSTALL = 'false'
-                    }
-                }
-            }
-        }
-        
-        stage('Install Apache') {
-            when {
-                expression { params.ACTION == 'full_deployment' || env.NEEDS_INSTALL == 'true' }
-            }
-            steps {
-                script {
-                    echo '=== Installing Apache Web Server ==='
-                    
-                    // Detect OS and install accordingly
-                    def osType = sh(script: 'cat /etc/os-release | grep "^ID=" | cut -d= -f2', returnStdout: true).trim()
-                    
-                    if (osType.contains('ubuntu') || osType.contains('debian')) {
-                        echo 'Detected Debian/Ubuntu system'
-                        sh '''
-                            sudo apt-get update
-                            sudo apt-get install -y apache2
-                        '''
-                        env.APACHE_LOG = '/var/log/apache2/access.log'
+                    echo '🔍 Detecting OS and Apache installation...'
+                    env.OS_ID = sh(
+                        script: "grep '^ID=' /etc/os-release | cut -d= -f2 | tr -d '\"'",
+                        returnStdout: true
+                    ).trim()
+
+                    if (fileExists('/usr/sbin/apache2')) {
+                        env.APACHE_CMD = 'apache2'
+                        env.SERVICE_NAME = 'apache2'
+                        env.ACCESS_LOG = '/var/log/apache2/access.log'
                         env.ERROR_LOG = '/var/log/apache2/error.log'
-                    } else if (osType.contains('centos') || osType.contains('rhel') || osType.contains('fedora')) {
-                        echo 'Detected RedHat/CentOS/Fedora system'
-                        sh '''
-                            sudo yum install -y httpd || sudo dnf install -y httpd
-                        '''
-                        env.APACHE_LOG = '/var/log/httpd/access_log'
+                    } else if (fileExists('/usr/sbin/httpd')) {
+                        env.APACHE_CMD = 'httpd'
+                        env.SERVICE_NAME = 'httpd'
+                        env.ACCESS_LOG = '/var/log/httpd/access_log'
                         env.ERROR_LOG = '/var/log/httpd/error_log'
                     } else {
-                        error("Unsupported operating system: ${osType}")
+                        env.APACHE_CMD = ''
+                    }
+
+                    echo "Detected OS: ${env.OS_ID}"
+                    echo "Apache binary: ${env.APACHE_CMD ?: 'Not found'}"
+                }
+            }
+        }
+
+        stage('Install Apache') {
+            when {
+                expression { params.ACTION == 'full_deployment' && !env.APACHE_CMD }
+            }
+            steps {
+                script {
+                    echo '📦 Installing Apache Web Server...'
+                    if (env.OS_ID in ['ubuntu', 'debian']) {
+                        sh 'sudo apt-get update && sudo apt-get install -y apache2'
+                    } else if (env.OS_ID in ['centos', 'rhel', 'fedora']) {
+                        sh 'sudo yum install -y httpd || sudo dnf install -y httpd'
+                    } else {
+                        error("Unsupported OS: ${env.OS_ID}")
                     }
                 }
             }
         }
-        
-        stage('Configure Apache') {
+
+        stage('Configure & Start Apache') {
             when {
-                expression { params.ACTION == 'full_deployment' || params.ACTION == 'config_update' }
+                expression { params.ACTION in ['full_deployment', 'config_update'] }
             }
             steps {
-                echo '=== Configuring Apache ==='
                 script {
-                    sh '''
-                        # Check which service command to use
-                        if command -v apache2 &> /dev/null; then
-                            SERVICE_NAME="apache2"
-                        else
-                            SERVICE_NAME="httpd"
-                        fi
-                        
-                        # Enable and start Apache
-                        sudo systemctl enable $SERVICE_NAME
-                        sudo systemctl start $SERVICE_NAME
-                        
-                        # Verify Apache is running
-                        sudo systemctl status $SERVICE_NAME --no-pager
-                    '''
+                    echo '⚙️ Configuring and starting Apache...'
+                    sh """
+                        sudo systemctl enable ${env.SERVICE_NAME}
+                        sudo systemctl restart ${env.SERVICE_NAME}
+                        sudo systemctl status ${env.SERVICE_NAME} --no-pager
+                    """
                 }
             }
         }
-        
+
         stage('Restart Apache') {
             when {
                 expression { params.ACTION == 'restart_only' }
             }
             steps {
-                echo '=== Restarting Apache ==='
-                sh '''
-                    if command -v apache2 &> /dev/null; then
-                        sudo systemctl restart apache2
-                    else
-                        sudo systemctl restart httpd
-                    fi
-                '''
+                echo '🔄 Restarting Apache service...'
+                sh "sudo systemctl restart ${env.SERVICE_NAME}"
             }
         }
-        
+
         stage('Verify Apache') {
             steps {
-                echo '=== Verifying Apache Installation ==='
-                script {
-                    sh '''
-                        # Check Apache version
-                        if command -v apache2 &> /dev/null; then
-                            apache2 -v
-                        else
-                            httpd -v
-                        fi
-                        
-                        # Check if Apache is listening on port 80
-                        sudo netstat -tuln | grep :80 || sudo ss -tuln | grep :80
-                        
-                        # Test local connection
-                        curl -I http://localhost || echo "Warning: Could not connect to localhost"
-                    '''
-                }
+                echo '✅ Verifying Apache installation and status...'
+                sh """
+                    ${env.APACHE_CMD} -v
+                    sudo ss -tuln | grep ':80' || echo 'Apache not listening on port 80!'
+                    curl -I http://localhost || echo 'Warning: Apache not responding'
+                """
             }
         }
-        
+
         stage('Analyze Logs') {
             when {
-                expression { params.ANALYZE_LOGS == true }
+                expression { params.ANALYZE_LOGS }
             }
             steps {
-                echo "=== Analyzing Apache Logs (last ${params.LOG_LINES} lines) ==="
                 script {
-                    sh '''
-                        # Determine log file location
-                        if [ -f /var/log/apache2/access.log ]; then
-                            ACCESS_LOG="/var/log/apache2/access.log"
-                            ERROR_LOG="/var/log/apache2/error.log"
-                        elif [ -f /var/log/httpd/access_log ]; then
-                            ACCESS_LOG="/var/log/httpd/access_log"
-                            ERROR_LOG="/var/log/httpd/error_log"
+                    echo "📊 Generating Apache log report (${params.LOG_LINES} lines)..."
+                    def logScript = """
+                        set -e
+                        REPORT="${env.REPORT_FILE}"
+                        ACCESS="${env.ACCESS_LOG}"
+                        ERROR="${env.ERROR_LOG}"
+
+                        echo "Apache Log Report - Build #${env.BUILD_NUMBER}" > $REPORT
+                        echo "Generated: $(date)" >> $REPORT
+                        echo "" >> $REPORT
+
+                        if [ -f "$ACCESS" ]; then
+                            echo "--- 4xx Client Errors ---" >> $REPORT
+                            sudo tail -n ${params.LOG_LINES} "$ACCESS" | grep ' 4[0-9][0-9] ' | wc -l >> $REPORT
+                            echo "--- 5xx Server Errors ---" >> $REPORT
+                            sudo tail -n ${params.LOG_LINES} "$ACCESS" | grep ' 5[0-9][0-9] ' | wc -l >> $REPORT
                         else
-                            echo "Warning: Apache logs not found"
-                            ACCESS_LOG=""
-                            ERROR_LOG=""
+                            echo "Access log not found" >> $REPORT
                         fi
-                        
-                        # Create report
-                        echo "==================================" > ''' + env.REPORT_FILE + '''
-                        echo "Apache Error Analysis Report" >> ''' + env.REPORT_FILE + '''
-                        echo "Build: ''' + env.BUILD_NUMBER + '''" >> ''' + env.REPORT_FILE + '''
-                        echo "Date: $(date)" >> ''' + env.REPORT_FILE + '''
-                        echo "==================================" >> ''' + env.REPORT_FILE + '''
-                        echo "" >> ''' + env.REPORT_FILE + '''
-                        
-                        if [ -f "$ACCESS_LOG" ]; then
-                            echo "--- 4xx Client Errors ---" >> ''' + env.REPORT_FILE + '''
-                            sudo tail -n ''' + params.LOG_LINES + ''' "$ACCESS_LOG" | grep " 4[0-9][0-9] " | wc -l >> ''' + env.REPORT_FILE + '''
-                            echo "Total 4xx errors found" >> ''' + env.REPORT_FILE + '''
-                            echo "" >> ''' + env.REPORT_FILE + '''
-                            
-                            echo "Sample 4xx errors:" >> ''' + env.REPORT_FILE + '''
-                            sudo tail -n ''' + params.LOG_LINES + ''' "$ACCESS_LOG" | grep " 4[0-9][0-9] " | head -10 >> ''' + env.REPORT_FILE + '''
-                            echo "" >> ''' + env.REPORT_FILE + '''
-                            
-                            echo "--- 5xx Server Errors ---" >> ''' + env.REPORT_FILE + '''
-                            sudo tail -n ''' + params.LOG_LINES + ''' "$ACCESS_LOG" | grep " 5[0-9][0-9] " | wc -l >> ''' + env.REPORT_FILE + '''
-                            echo "Total 5xx errors found" >> ''' + env.REPORT_FILE + '''
-                            echo "" >> ''' + env.REPORT_FILE + '''
-                            
-                            echo "Sample 5xx errors:" >> ''' + env.REPORT_FILE + '''
-                            sudo tail -n ''' + params.LOG_LINES + ''' "$ACCESS_LOG" | grep " 5[0-9][0-9] " | head -10 >> ''' + env.REPORT_FILE + '''
-                        else
-                            echo "Access log not found or not readable" >> ''' + env.REPORT_FILE + '''
-                        fi
-                        
-                        echo "" >> ''' + env.REPORT_FILE + '''
-                        echo "--- Recent Error Log Entries ---" >> ''' + env.REPORT_FILE + '''
-                        if [ -f "$ERROR_LOG" ]; then
-                            sudo tail -n 20 "$ERROR_LOG" >> ''' + env.REPORT_FILE + '''
-                        else
-                            echo "Error log not found" >> ''' + env.REPORT_FILE + '''
-                        fi
-                        
-                        # Display report
-                        cat ''' + env.REPORT_FILE + '''
-                    '''
+
+                        echo "" >> $REPORT
+                        echo "--- Recent Error Log Entries ---" >> $REPORT
+                        [ -f "$ERROR" ] && sudo tail -n 20 "$ERROR" >> $REPORT || echo "Error log not found" >> $REPORT
+
+                        cat $REPORT
+                    """
+                    writeFile file: 'analyze_logs.sh', text: logScript
+                    sh 'chmod +x analyze_logs.sh && ./analyze_logs.sh'
                 }
             }
         }
     }
-    
+
     post {
         always {
-            echo '=== Pipeline Execution Complete ==='
+            echo '📁 Archiving artifacts...'
             script {
                 if (fileExists(env.REPORT_FILE)) {
                     archiveArtifacts artifacts: env.REPORT_FILE, fingerprint: true
-                    echo "Report archived: ${env.REPORT_FILE}"
                 }
             }
         }
         success {
-            echo '✓ Pipeline completed successfully!'
+            echo '🎉 Apache pipeline completed successfully!'
         }
         failure {
-            echo '✗ Pipeline failed. Check logs above for details.'
+            echo '❌ Pipeline failed. Please check logs.'
         }
     }
 }
